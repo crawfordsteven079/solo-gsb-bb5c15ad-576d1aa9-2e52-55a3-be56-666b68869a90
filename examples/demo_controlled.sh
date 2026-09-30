@@ -46,9 +46,10 @@ printf '错误口令: HTTP %s\n' "$(code -X POST "${BASE_URL}/records/${RECORD_I
 printf 'bob(仅 reviewer)提交: HTTP %s\n' "$(code -X POST "${BASE_URL}/records/${RECORD_ID}/publish-requests" \
   -u "bob:${BOB_PW}" -H 'Content-Type: application/json' -d '{"version":1}')"
 
-step "6. alice(operator) 提交版本 1 的发布申请（可带 expires_in_seconds/expires_at）"
+step "6. alice(operator) 提交版本 1 的发布申请（可带 expires_in_seconds/expires_at；max_reads 冻结读取次数上限）"
 SUBMIT=$(curl -sS -X POST "${BASE_URL}/records/${RECORD_ID}/publish-requests" \
-  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d '{"version": 1}')
+  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" \
+  -d '{"version": 1, "max_reads": 2}')
 echo "${SUBMIT}" | jq .
 REQUEST_ID=$(echo "${SUBMIT}" | jq -r .request_id)
 
@@ -70,8 +71,14 @@ echo "${APPROVE}" | jq .
 SNAPSHOT_ID=$(echo "${APPROVE}" | jq -r .snapshot_id)
 TOKEN=$(echo "${APPROVE}" | jq -r .token)
 
-step "10. 公开读取：得到冻结版本 1 的脱敏正文，与后续修订无关"
+step "10. 公开读取：得到冻结版本 1 的脱敏正文，与后续修订无关（上限 2 次：第 3 次模糊拒绝）"
 curl -sS "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}" | jq .
+for i in 2 3; do
+  printf '第 %s 次读取: HTTP %s\n' "$i" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}")"
+done
+echo "维护侧查询已用/剩余次数（不含快照原文）:"
+curl -sS "${BASE_URL}/tokens/${TOKEN}/usage" "${AUTH[@]}" | jq .
 
 step "11. 已终结申请不能再复核（再次批准/驳回均 409）"
 printf '再次批准: HTTP %s\n' "$(code -X POST "${BASE_URL}/publish-requests/${REQUEST_ID}/approve" -u "bob:${BOB_PW}")"

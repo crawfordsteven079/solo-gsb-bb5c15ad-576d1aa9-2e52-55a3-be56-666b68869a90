@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, status
-from sqlalchemy import func, inspect, select, text, update
+from sqlalchemy import func, inspect, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -41,6 +41,7 @@ from .schemas import (
     ReviewRejectRequest,
     RevokeResponse,
     SnapshotInfo,
+    TokenUsageResponse,
 )
 from .security import Operator, require_operator, require_role, require_service_key
 
@@ -64,13 +65,15 @@ def _init_db_with_retry() -> None:
 def _apply_lightweight_migrations() -> None:
     """对既有库做幂等的加列/补列升级（仅用于本轮新增字段，安全可重复执行）。"""
     inspector = inspect(engine)
-    table_columns = {column["name"] for column in inspector.get_columns("records")}
+    existing_tables = set(inspector.get_table_names())
     statements: list[str] = []
-    if "controlled" not in table_columns:
-        statements.append(
-            "ALTER TABLE records ADD COLUMN controlled BOOLEAN NOT NULL DEFAULT false"
-        )
-    if "publish_requests" in inspector.get_table_names():
+    if "records" in existing_tables:
+        table_columns = {column["name"] for column in inspector.get_columns("records")}
+        if "controlled" not in table_columns:
+            statements.append(
+                "ALTER TABLE records ADD COLUMN controlled BOOLEAN NOT NULL DEFAULT false"
+            )
+    if "publish_requests" in existing_tables:
         request_columns = {
             column["name"] for column in inspector.get_columns("publish_requests")
         }
@@ -83,9 +86,51 @@ def _apply_lightweight_migrations() -> None:
             statements.append(
                 "ALTER TABLE publish_requests ADD COLUMN token_expires_at TIMESTAMP"
             )
+        if "token_max_reads" not in request_columns:
+            # 申请时冻结的读取次数上限；既有申请为 NULL（不限次）
+            statements.append(
+                "ALTER TABLE publish_requests ADD COLUMN token_max_reads INTEGER"
+            )
         # 早期版本曾冗余存放令牌；统一以 read_tokens 为准，删除冗余列
         if "published_token" in request_columns:
             statements.append("ALTER TABLE publish_requests DROP COLUMN published_token")
+        request_constraints = {
+            constraint["name"] for constraint in inspector.get_check_constraints("publish_requests")
+        }
+        if "ck_publish_requests_token_max_reads" not in request_constraints:
+            statements.append(
+                "ALTER TABLE publish_requests ADD CONSTRAINT "
+                "ck_publish_requests_token_max_reads "
+                "CHECK (token_max_reads IS NULL OR token_max_reads > 0)"
+            )
+    if "read_tokens" in existing_tables:
+        token_columns = {column["name"] for column in inspector.get_columns("read_tokens")}
+        if "max_reads" not in token_columns:
+            # 既有令牌没有上限：NULL 表示不限次
+            statements.append("ALTER TABLE read_tokens ADD COLUMN max_reads INTEGER")
+        if "read_count" not in token_columns:
+            # 既有令牌从未计数，从 0 开始
+            statements.append(
+                "ALTER TABLE read_tokens ADD COLUMN read_count INTEGER NOT NULL DEFAULT 0"
+            )
+        token_constraints = {
+            constraint["name"] for constraint in inspector.get_check_constraints("read_tokens")
+        }
+        if "ck_read_tokens_max_reads" not in token_constraints:
+            statements.append(
+                "ALTER TABLE read_tokens ADD CONSTRAINT ck_read_tokens_max_reads "
+                "CHECK (max_reads IS NULL OR max_reads > 0)"
+            )
+        if "ck_read_tokens_read_count" not in token_constraints:
+            statements.append(
+                "ALTER TABLE read_tokens ADD CONSTRAINT ck_read_tokens_read_count "
+                "CHECK (read_count >= 0)"
+            )
+        if "ck_read_tokens_count_within_limit" not in token_constraints:
+            statements.append(
+                "ALTER TABLE read_tokens ADD CONSTRAINT ck_read_tokens_count_within_limit "
+                "CHECK (max_reads IS NULL OR read_count <= max_reads)"
+            )
     if statements:
         with engine.begin() as conn:
             for statement in statements:
@@ -100,8 +145,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.1.0",
-    summary="机构公开脱敏记录服务（支持受控发布的申请-复核流程）",
+    version="1.2.0",
+    summary="机构公开脱敏记录服务（支持受控发布与读取次数上限）",
     lifespan=lifespan,
 )
 
@@ -146,6 +191,7 @@ def _request_info(request: PublishRequestModel) -> PublishRequestInfo:
         reason=request.reason,
         token_expires_in_seconds=request.token_expires_in_seconds,
         token_expires_at=request.token_expires_at,
+        token_max_reads=request.token_max_reads,
         snapshot_id=request.snapshot_id,
         created_at=request.created_at,
         decided_at=request.decided_at,
@@ -299,7 +345,10 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         )
     ).scalar_one()
     token = ReadToken(
-        token=secrets.token_urlsafe(32), snapshot_id=snapshot.id, expires_at=expires_at
+        token=secrets.token_urlsafe(32),
+        snapshot_id=snapshot.id,
+        expires_at=expires_at,
+        max_reads=payload.max_reads,
     )
     db.add(token)
     db.commit()
@@ -310,6 +359,7 @@ def publish_record(record_id: UUID, payload: PublishPayload, db: Session = Depen
         "status": SNAPSHOT_STATUS,
         "token": token.token,
         "expires_at": expires_at,
+        "max_reads": payload.max_reads,
     }
 
 
@@ -353,6 +403,7 @@ def submit_publish_request(
         requested_by=operator.username,
         token_expires_in_seconds=payload.expires_in_seconds,
         token_expires_at=expires_at,
+        token_max_reads=payload.max_reads,
     )
     db.add(request)
     db.commit()
@@ -435,6 +486,7 @@ def approve_publish_request(
         token=secrets.token_urlsafe(32),
         snapshot_id=snapshot.id,
         expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
     )
     db.add(token)
     db.flush()  # 确保令牌已在事务内落库后再终结申请
@@ -453,6 +505,7 @@ def approve_publish_request(
         snapshot_id=snapshot.id,
         token=token.token,
         expires_at=token_expires_at,
+        max_reads=request.token_max_reads,
     )
 
 
@@ -563,6 +616,34 @@ def revoke_token(token: str, db: Session = Depends(get_db)):
 
 
 @app.get(
+    "/tokens/{token}/usage",
+    response_model=TokenUsageResponse,
+    dependencies=[Depends(require_service_key)],
+)
+def get_token_usage(token: str, db: Session = Depends(get_db)):
+    """维护侧查询令牌的读取次数用量：上限、已用、剩余（不含快照原文）。"""
+    read_token = db.get(ReadToken, token)
+    if read_token is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="token not found")
+    remaining = (
+        None
+        if read_token.max_reads is None
+        else max(read_token.max_reads - read_token.read_count, 0)
+    )
+    return TokenUsageResponse(
+        token=read_token.token,
+        snapshot_id=read_token.snapshot_id,
+        max_reads=read_token.max_reads,
+        read_count=read_token.read_count,
+        remaining_reads=remaining,
+        expires_at=read_token.expires_at,
+        revoked=read_token.revoked_at is not None,
+        revoked_at=read_token.revoked_at,
+        created_at=read_token.created_at,
+    )
+
+
+@app.get(
     "/records/{record_id}",
     response_model=RecordStatusResponse,
     dependencies=[Depends(require_service_key)],
@@ -601,7 +682,11 @@ def read_snapshot(
     token: str = Query(..., description="发布时签发的读取令牌"),
     db: Session = Depends(get_db),
 ):
-    """公开读取：凭有效令牌返回脱敏正文；任何失败都返回统一的模糊错误。"""
+    """公开读取：凭有效令牌返回脱敏正文，每次成功读取消耗一次额度。
+
+    任何失败（快照/令牌不存在、令牌与快照不匹配、已撤销、已到期、达到上限）
+    都返回统一的模糊 403，失败请求一律不消耗次数。
+    """
     snapshot = db.get(Snapshot, snapshot_id)
     read_token = db.get(ReadToken, token)
     now = datetime.now(timezone.utc)
@@ -612,7 +697,31 @@ def read_snapshot(
         or read_token.revoked_at is not None
         or (read_token.expires_at is not None and read_token.expires_at <= now)
     ):
-        # 不区分“不存在 / 已撤销 / 已过期”，避免泄露任何信息
+        # 不区分“不存在 / 不匹配 / 已撤销 / 已过期”，避免泄露任何信息；不消耗次数
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
+        )
+    # 单条条件 UPDATE 原子地“判定并消耗”一次：
+    #   - 撤销/到期条件再次进入 WHERE，即使额度剩余也不放行（撤销、到期优先）；
+    #   - 次数上限与自增在同一行锁内判定，并发成功读取数绝不会超过上限；
+    #   - 未设置上限（max_reads IS NULL）的令牌只增计数、不做次数拦截。
+    consumed = db.execute(
+        update(ReadToken)
+        .where(
+            ReadToken.token == token,
+            ReadToken.snapshot_id == snapshot.id,
+            ReadToken.revoked_at.is_(None),
+            or_(ReadToken.expires_at.is_(None), ReadToken.expires_at > now),
+            or_(
+                ReadToken.max_reads.is_(None),
+                ReadToken.read_count < ReadToken.max_reads,
+            ),
+        )
+        .values(read_count=ReadToken.read_count + 1)
+    ).rowcount
+    db.commit()
+    if not consumed:
+        # 达到上限，或令牌在检查后被撤销/到期：沿用既有模糊拒绝，且本次未计数
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="snapshot unavailable"
         )

@@ -73,4 +73,19 @@ echo "（等待 3 秒让令牌过期…）"
 sleep 3
 curl -sS "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN2}" | jq .
 
+step "12. 限读 2 次的令牌：第 3 次读取沿用模糊拒绝"
+PUB3=$(curl -sS -X POST "${BASE_URL}/records/${RECORD_ID}/publish" "${AUTH[@]}" \
+  -d '{"version": 2, "max_reads": 2}')
+echo "${PUB3}" | jq .
+TOKEN3=$(echo "${PUB3}" | jq -r .token)
+for i in 1 2 3; do
+  printf '第 %s 次读取: HTTP %s\n' "$i" \
+    "$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN3}")"
+done
+echo "维护侧查询用量（不返回快照原文）:"
+curl -sS "${BASE_URL}/tokens/${TOKEN3}/usage" "${AUTH[@]}" | jq .
+echo "错误令牌（无效/不匹配）不消耗次数："
+printf '错误令牌: HTTP %s；用量 read_count 仍为 2\n' \
+  "$(curl -sS -o /dev/null -w '%{http_code}' "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=wrong-token")"
+
 printf '\n\033[1m演示完成。\033[0m\n'

@@ -74,9 +74,22 @@ class Snapshot(Base):
 
 
 class ReadToken(Base):
-    """快照的随机读取令牌，可设到期时间、可撤销。"""
+    """快照的随机读取令牌，可设到期时间、可撤销，并可限制成功读取次数。
+
+    - max_reads 为 NULL 时不限次数（既有令牌与未设置上限的新令牌）；
+      正整数时为成功读取次数上限，read_count 记录已成功消耗的次数。
+    - 同一快照的不同令牌各自计数。
+    """
 
     __tablename__ = "read_tokens"
+    __table_args__ = (
+        CheckConstraint("max_reads IS NULL OR max_reads > 0", name="ck_read_tokens_max_reads"),
+        CheckConstraint("read_count >= 0", name="ck_read_tokens_read_count"),
+        CheckConstraint(
+            "max_reads IS NULL OR read_count <= max_reads",
+            name="ck_read_tokens_count_within_limit",
+        ),
+    )
 
     token: Mapped[str] = mapped_column(String(64), primary_key=True)
     snapshot_id: Mapped[uuid.UUID] = mapped_column(
@@ -88,6 +101,12 @@ class ReadToken(Base):
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 成功读取次数上限：NULL 表示不限次；正整数由请求校验保证
+    max_reads: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 已凭本令牌成功读取的次数；消耗由单条条件 UPDATE 原子完成
+    read_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
 
 
 # 受控发布申请的终态
@@ -107,6 +126,10 @@ class PublishRequest(Base):
     __tablename__ = "publish_requests"
     __table_args__ = (
         CheckConstraint("status IN ('pending', 'approved', 'rejected')", name="ck_publish_requests_status"),
+        CheckConstraint(
+            "token_max_reads IS NULL OR token_max_reads > 0",
+            name="ck_publish_requests_token_max_reads",
+        ),
         Index("ix_publish_requests_record", "record_id", "created_at"),
     )
 
@@ -129,6 +152,8 @@ class PublishRequest(Base):
     # 令牌到期策略（提交时确定）：相对时长在批准签发时才换算成绝对时刻
     token_expires_in_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 令牌读取次数上限（申请时冻结）：NULL 表示不限次，批准签发时原样写入令牌
+    token_max_reads: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # 批准后同事务生成的快照（驳回时保持为空；令牌经 snapshot_id 关联，不在此冗余）
     snapshot_id: Mapped[uuid.UUID | None] = mapped_column(

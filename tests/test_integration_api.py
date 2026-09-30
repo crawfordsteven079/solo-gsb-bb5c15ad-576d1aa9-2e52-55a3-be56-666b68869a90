@@ -520,6 +520,287 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["controlled"])
 
+    # ---- 读取次数上限（本轮新增） ----
+
+    def _publish(self, version=1, max_reads=..., expires=None, expected=201):
+        body = {"version": version}
+        if max_reads is not ...:
+            body["max_reads"] = max_reads
+        if expires is not None:
+            body.update(expires)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish", headers=SERVICE_HEADERS, json=body
+        )
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _read(self, snapshot_id, token, expected=200):
+        r = self.client.get(f"/public/snapshots/{snapshot_id}?token={token}")
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def _usage(self, token, expected=200):
+        r = self.client.get(f"/tokens/{token}/usage", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, expected, r.text)
+        return r
+
+    def test_direct_publish_response_shows_max_reads(self):
+        r = self._publish(max_reads=3)
+        self.assertEqual(r.json()["max_reads"], 3)
+        # 不设置上限时签发结果为 null（不限次）
+        r = self._publish(max_reads=None)
+        self.assertIsNone(r.json()["max_reads"])
+
+    def test_non_positive_max_reads_is_422(self):
+        self._publish(max_reads=0, expected=422)
+        self._publish(max_reads=-1, expected=422)
+        # 被拒绝的请求不落库任何快照/令牌
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.json()["snapshots"], [])
+
+    def test_limited_token_exhausts_then_blurry_403(self):
+        pub = self._publish(max_reads=2).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        # 前两次成功并逐次消耗
+        self._read(sid, token)
+        self._read(sid, token)
+        # 达到上限后沿用既有模糊拒绝
+        r = self._read(sid, token, expected=403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        # 超额后的拒绝不再增加计数
+        self._read(sid, token, expected=403)
+        usage = self._usage(token).json()
+        self.assertEqual(usage["max_reads"], 2)
+        self.assertEqual(usage["read_count"], 2)
+        self.assertEqual(usage["remaining_reads"], 0)
+        self.assertFalse(usage["revoked"])
+
+    def test_unlimited_token_keeps_unlimited_reads(self):
+        pub = self._publish(max_reads=None).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        for _ in range(6):
+            self._read(sid, token)
+        usage = self._usage(token).json()
+        self.assertIsNone(usage["max_reads"])
+        self.assertIsNone(usage["remaining_reads"])
+        self.assertEqual(usage["read_count"], 6)
+
+    def test_separate_tokens_for_same_snapshot_count_independently(self):
+        # 同一快照（同 record+version 的重复发布只产生一份快照）的两个令牌各自计数
+        first = self._publish(version=1, max_reads=1).json()
+        sid = first["snapshot_id"]
+        second = self._publish(version=1, max_reads=2).json()
+        self.assertEqual(second["snapshot_id"], sid)
+        t1, t2 = first["token"], second["token"]
+        self._read(sid, t1)
+        # 令牌 1 用尽，不影响令牌 2
+        self._read(sid, t1, expected=403)
+        self._read(sid, t2)
+        self._read(sid, t2)
+        self._read(sid, t2, expected=403)
+        self.assertEqual(self._usage(t1).json()["read_count"], 1)
+        self.assertEqual(self._usage(t2).json()["read_count"], 2)
+
+    def test_failed_reads_do_not_consume(self):
+        import uuid
+
+        pub = self._publish(max_reads=3).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        # 令牌与快照不匹配
+        other = self._publish(version=1, max_reads=3).json()
+        # 其他记录的快照与本令牌不匹配（新建一条记录再发布）
+        r = self.client.post(
+            "/records", headers=SERVICE_HEADERS,
+            json={"text": "另一条记录正文XYZ", "intervals": [{"start": 3, "end": 6}]},
+        )
+        other_record = r.json()["record_id"]
+        r = self.client.post(
+            f"/records/{other_record}/publish",
+            headers=SERVICE_HEADERS, json={"version": 1},
+        )
+        other_sid = r.json()["snapshot_id"]
+        self._read(other_sid, token, expected=403)
+        # 快照不存在 / 令牌无效
+        self._read(sid, "not-a-real-token", expected=403)
+        self._read(str(uuid.uuid4()), token, expected=403)
+        # 全部失败后额度原样保留：仍可成功读取 3 次
+        self._read(sid, token)
+        self._read(sid, token)
+        self._read(sid, token)
+        self._read(sid, token, expected=403)
+        self.assertEqual(self._usage(token).json()["read_count"], 3)
+        # 未使用：other 令牌仍满额（其快照被一次失败请求引用但未计数）
+        self.assertEqual(self._usage(other["token"]).json()["read_count"], 0)
+
+    def test_revocation_takes_precedence_over_remaining_reads(self):
+        pub = self._publish(max_reads=10).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        self._read(sid, token)
+        # 尚余 9 次，但撤销优先生效
+        r = self.client.post(f"/tokens/{token}/revoke", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200)
+        self._read(sid, token, expected=403)
+        usage = self._usage(token).json()
+        self.assertTrue(usage["revoked"])
+        self.assertEqual(usage["read_count"], 1)
+        self.assertEqual(usage["remaining_reads"], 9)
+
+    def test_expiry_takes_precedence_over_remaining_reads(self):
+        pub = self._publish(max_reads=10, expires={"expires_in_seconds": 1}).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        self._read(sid, token)
+        # 到期后即使额度未用尽也一律拒绝，且不消耗
+        import time as _time
+
+        _time.sleep(1.2)
+        self._read(sid, token, expected=403)
+        usage = self._usage(token).json()
+        self.assertEqual(usage["read_count"], 1)
+
+    def test_concurrent_reads_never_exceed_limit(self):
+        limit = 20
+        pub = self._publish(max_reads=limit).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        attempts = 50
+        results: list[int] = []
+        barrier = threading.Barrier(attempts)
+
+        def read_once():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            r = client.get(f"/public/snapshots/{sid}?token={token}")
+            results.append(r.status_code)
+
+        threads = [threading.Thread(target=read_once) for _ in range(attempts)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count(200), limit, results)
+        self.assertEqual(results.count(403), attempts - limit)
+        usage = self._usage(token).json()
+        self.assertEqual(usage["read_count"], limit)
+        self.assertEqual(usage["remaining_reads"], 0)
+
+    def test_token_usage_requires_service_key_and_hides_text(self):
+        import uuid
+
+        pub = self._publish(max_reads=1).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        # 无密钥 401
+        self.assertEqual(self.client.get(f"/tokens/{token}/usage").status_code, 401)
+        # 未知令牌 404
+        self.assertEqual(self._usage("nope", expected=404).status_code, 404)
+        # 正常用量响应只含元数据，不含快照/原文相关字段
+        usage = self._usage(token).json()
+        self.assertEqual(usage["snapshot_id"], sid)
+        self.assertNotIn("redacted_text", usage)
+        self.assertNotIn("record_id", usage)
+        self.assertEqual(usage["read_count"], 0)
+        self.assertEqual(usage["remaining_reads"], 1)
+
+    def test_controlled_request_freezes_max_reads_and_approval_effective(self):
+        self._mark_controlled()
+        # 申请时冻结上限；申请信息可见冻结值，尚未签发令牌
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE, json={"version": 1, "max_reads": 2},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        request_id = r.json()["request_id"]
+        info = self.client.get(
+            f"/publish-requests/{request_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["token_max_reads"], 2)
+        # 批准签发后上限生效并回显
+        r = self.client.post(
+            f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["max_reads"], 2)
+        sid, token = r.json()["snapshot_id"], r.json()["token"]
+        self._read(sid, token)
+        self._read(sid, token)
+        self._read(sid, token, expected=403)
+        self.assertEqual(self._usage(token).json()["read_count"], 2)
+
+    def test_controlled_rejection_creates_no_token_or_count(self):
+        self._mark_controlled()
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE, json={"version": 1, "max_reads": 5},
+        )
+        request_id = r.json()["request_id"]
+        r = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB, json={"reason": "不予公开"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["token_max_reads"], 5)
+        # 驳回不生成快照或令牌
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.json()["snapshots"], [])
+        from sqlalchemy import select as _select
+
+        from app.db import SessionLocal
+        from app.models import ReadToken as RT
+        from app.models import Snapshot as Snap
+
+        with SessionLocal() as session:
+            tokens_for_record = (
+                session.query(RT)
+                .filter(
+                    RT.snapshot_id.in_(
+                        _select(Snap.id).where(Snap.record_id == self.record_id)
+                    )
+                )
+                .count()
+            )
+            self.assertEqual(tokens_for_record, 0)
+
+    def test_controlled_non_positive_max_reads_is_422(self):
+        self._mark_controlled()
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE, json={"version": 1, "max_reads": 0},
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_existing_db_gets_read_limit_columns(self):
+        from sqlalchemy import inspect, text
+
+        from app.db import engine
+
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_count_within_limit"))
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_read_count"))
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_max_reads"))
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN read_count"))
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN max_reads"))
+            conn.execute(text("ALTER TABLE publish_requests DROP COLUMN token_max_reads"))
+        app_main._init_db_with_retry()
+        inspector = inspect(engine)
+        token_columns = {c["name"] for c in inspector.get_columns("read_tokens")}
+        self.assertIn("max_reads", token_columns)
+        self.assertIn("read_count", token_columns)
+        request_columns = {c["name"] for c in inspector.get_columns("publish_requests")}
+        self.assertIn("token_max_reads", request_columns)
+        # 既有令牌迁移后不限次、计数为 0，仍可正常读取
+        pub = self._publish(max_reads=None).json()
+        sid, token = pub["snapshot_id"], pub["token"]
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_count_within_limit"))
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_read_count"))
+            conn.execute(text("ALTER TABLE read_tokens DROP CONSTRAINT IF EXISTS ck_read_tokens_max_reads"))
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN read_count"))
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN max_reads"))
+        app_main._init_db_with_retry()
+        self._read(sid, token)
+        usage = self._usage(token).json()
+        self.assertIsNone(usage["max_reads"])
+        self.assertEqual(usage["read_count"], 1)
+        self.assertIsNone(usage["remaining_reads"])
+
 
 if __name__ == "__main__":
     unittest.main()
