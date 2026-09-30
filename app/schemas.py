@@ -27,6 +27,9 @@ class PublishRequest(BaseModel):
     # 两种到期方式二选一，均不填则令牌永不到期
     expires_in_seconds: int | None = Field(default=None, gt=0)
     expires_at: datetime | None = None
+    # 可选的成功读取次数上限（正整数）；不填表示不限次。
+    # 直接发布时确定；受控发布在提交申请时冻结，批准签发后生效。
+    max_reads: int | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _only_one_expiry(self):
@@ -74,6 +77,26 @@ class PublishResponse(BaseModel):
     status: str
     token: str
     expires_at: datetime | None
+    # 该令牌的成功读取次数上限；null 表示不限次
+    max_reads: int | None = None
+
+
+class TokenStatusResponse(BaseModel):
+    """维护侧令牌状态：只含计数与元数据，绝不返回快照原文。"""
+
+    token: str
+    snapshot_id: UUID
+    record_id: UUID
+    version: int
+    created_at: datetime
+    expires_at: datetime | None
+    revoked_at: datetime | None
+    # null 表示不限次；此时 remaining_reads 也为 null
+    max_reads: int | None
+    reads_used: int
+    remaining_reads: int | None
+    # 便于维护侧排查：invalid/expired 等状态仅用于维护接口，不影响公开侧的模糊拒绝
+    active: bool
 
 
 class RevokeResponse(BaseModel):
@@ -102,6 +125,8 @@ class PublishRequestInfo(BaseModel):
     # 提交时选择的令牌到期策略；批准后 token_expires_at 为实际绝对到期时刻
     token_expires_in_seconds: int | None
     token_expires_at: datetime | None
+    # 申请时冻结的读取次数上限；null 表示不限次
+    token_max_reads: int | None
     snapshot_id: UUID | None
     created_at: datetime
     decided_at: datetime | None
@@ -130,3 +155,5 @@ class ApproveResponse(BaseModel):
     snapshot_id: UUID
     token: str
     expires_at: datetime | None
+    # 批准签发令牌的成功读取次数上限；null 表示不限次
+    max_reads: int | None = None

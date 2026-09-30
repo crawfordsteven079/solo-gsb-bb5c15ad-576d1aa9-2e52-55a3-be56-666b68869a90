@@ -46,11 +46,14 @@ printf '错误口令: HTTP %s\n' "$(code -X POST "${BASE_URL}/records/${RECORD_I
 printf 'bob(仅 reviewer)提交: HTTP %s\n' "$(code -X POST "${BASE_URL}/records/${RECORD_ID}/publish-requests" \
   -u "bob:${BOB_PW}" -H 'Content-Type: application/json' -d '{"version":1}')"
 
-step "6. alice(operator) 提交版本 1 的发布申请（可带 expires_in_seconds/expires_at）"
+step "6. alice(operator) 提交版本 1 的发布申请（可带 expires_* 与 max_reads；申请时冻结）"
 SUBMIT=$(curl -sS -X POST "${BASE_URL}/records/${RECORD_ID}/publish-requests" \
-  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d '{"version": 1}')
+  -u "alice:${ALICE_PW}" -H "Content-Type: application/json" -d '{"version": 1, "max_reads": 2}')
 echo "${SUBMIT}" | jq .
 REQUEST_ID=$(echo "${SUBMIT}" | jq -r .request_id)
+echo "申请详情中的冻结上限 token_max_reads:"
+curl -sS "${BASE_URL}/publish-requests/${REQUEST_ID}" -u "alice:${ALICE_PW}" \
+  | jq '{status, token_expires_in_seconds, token_expires_at, token_max_reads}'
 
 step "7. 申请人不得复核：alice 批准/驳回自己的申请 -> 403"
 printf 'alice 批准: HTTP %s\n' "$(code -X POST "${BASE_URL}/publish-requests/${REQUEST_ID}/approve" -u "alice:${ALICE_PW}")"
@@ -64,14 +67,20 @@ curl -sS -X PUT "${BASE_URL}/records/${RECORD_ID}" "${AUTH[@]}" -d '{
   "intervals": [{"start": 9, "end": 15}]
 }' | jq .
 
-step "9. bob(reviewer) 批准：同一事务生成不可变快照 + 新读取令牌"
+step "9. bob(reviewer) 批准：同一事务生成不可变快照 + 新读取令牌（上限随申请冻结值生效）"
 APPROVE=$(curl -sS -X POST "${BASE_URL}/publish-requests/${REQUEST_ID}/approve" -u "bob:${BOB_PW}")
-echo "${APPROVE}" | jq .
+echo "${APPROVE}" | jq '{request_id, status, snapshot_id, token, expires_at, max_reads}'
 SNAPSHOT_ID=$(echo "${APPROVE}" | jq -r .snapshot_id)
 TOKEN=$(echo "${APPROVE}" | jq -r .token)
 
-step "10. 公开读取：得到冻结版本 1 的脱敏正文，与后续修订无关"
+step "10. 公开读取：得到冻结版本 1 的脱敏正文；上限 2 次，第 3 次起 403"
 curl -sS "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}" | jq .
+printf '第 2 次: HTTP %s；第 3 次(用尽): HTTP %s\n' \
+  "$(code "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}")" \
+  "$(code "${BASE_URL}/public/snapshots/${SNAPSHOT_ID}?token=${TOKEN}")"
+echo "维护侧查询已用/剩余次数（不含原文）:"
+curl -sS "${BASE_URL}/tokens/${TOKEN}" "${AUTH[@]}" \
+  | jq '{snapshot_id, version, max_reads, reads_used, remaining_reads, active}'
 
 step "11. 已终结申请不能再复核（再次批准/驳回均 409）"
 printf '再次批准: HTTP %s\n' "$(code -X POST "${BASE_URL}/publish-requests/${REQUEST_ID}/approve" -u "bob:${BOB_PW}")"

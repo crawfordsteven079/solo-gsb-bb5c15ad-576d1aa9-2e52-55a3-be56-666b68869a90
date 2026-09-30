@@ -7,6 +7,8 @@
 - **直接发布**（既有能力）：维护人员凭服务密钥直接发布指定版本；
 - **受控发布**（本轮新增）：机构先把记录标记为受控，操作者用**各自的凭据与身份**提交指定历史版本的发布申请，由**另一名具复核资格者**批准或驳回（申请人不得复核）；批准时在同一事务生成不可变快照与新读取令牌。
 
+签发快照读取令牌时可**可选**地设置正整数**读取次数上限**（`max_reads`）：直接发布在请求时确定，受控发布在提交申请时冻结、批准签发后生效。公开读取沿用既有脱敏正文响应，每次凭有效令牌**成功读取**消耗一次；无效、撤销、到期、令牌与快照不匹配或已达上限的请求不消耗次数。
+
 - 技术栈：Python 3.12 · FastAPI · SQLAlchemy 2 · PostgreSQL 16
 - 服务地址：`http://localhost:8000`（交互式文档：`http://localhost:8000/docs`）
 
@@ -57,12 +59,13 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 | `POST` | `/records` | 服务密钥 | 创建记录（版本 1），提交原文与敏感区间 |
 | `PUT` | `/records/{record_id}` | 服务密钥 | 修订：携带 `base_version`，过期返回 `409` 与当前版本 |
 | `PUT` | `/records/{record_id}/controlled` | 服务密钥 | 将记录设为受控发布（幂等） |
-| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本；**受控记录一律 `409` 拒绝** |
-| `POST` | `/records/{record_id}/publish-requests` | operator | 提交受控发布申请（冻结指定历史版本内容） |
-| `POST` | `/publish-requests/{request_id}/approve` | reviewer（非申请人） | 批准：同事务生成快照 + 新读取令牌 |
-| `POST` | `/publish-requests/{request_id}/reject` | reviewer（非申请人） | 驳回（可带 `reason`），驳回为终态 |
-| `GET` | `/publish-requests/{request_id}` | 任一已认证操作者 | 查询单个申请状态（不含原文） |
+| `POST` | `/records/{record_id}/publish` | 服务密钥 | 直接发布指定版本（可带 `max_reads` 上限）；**受控记录一律 `409` 拒绝** |
+| `POST` | `/records/{record_id}/publish-requests` | operator | 提交受控发布申请（冻结指定历史版本内容与 `max_reads`） |
+| `POST` | `/publish-requests/{request_id}/approve` | reviewer（非申请人） | 批准：同事务生成快照 + 新读取令牌（冻结的上限生效） |
+| `POST` | `/publish-requests/{request_id}/reject` | reviewer（非申请人） | 驳回（可带 `reason`），驳回为终态，不生成令牌或计数 |
+| `GET` | `/publish-requests/{request_id}` | 任一已认证操作者 | 查询单个申请状态（含冻结的 `token_max_reads`，不含原文） |
 | `GET` | `/records/{record_id}/publish-requests` | 任一已认证操作者 | 列出某记录的全部申请（不含原文） |
+| `GET` | `/tokens/{token}` | 服务密钥 | 查询令牌状态：上限 `max_reads`、已用 `reads_used`、剩余 `remaining_reads`（不含原文） |
 | `POST` | `/tokens/{token}/revoke` | 服务密钥 | 撤销读取令牌（含受控发布签发的令牌） |
 | `GET` | `/records/{record_id}` | 服务密钥 | 查看当前版本、受控标记与快照列表 |
 | `GET` | `/public/snapshots/{snapshot_id}?token=...` | 无（凭令牌） | 公开读取脱敏正文 |
@@ -73,6 +76,18 @@ Compose 会启动 PostgreSQL 与 API 两个容器，自动完成依赖安装与�
 - 左闭右开 `[start, end)`，位置按 **Unicode 码点**计（与 Python 字符串下标一致，BMP 之外的字符算 1 个码点）。
 - 越界、为空或倒置的区间 → `422`，**整次拒绝**，不落库任何内容。
 - 发布时合并**相交或相邻**的区间，每段替换为 `[已遮蔽]`，其余原文保留。
+
+### 读取次数上限（`max_reads`）
+
+签发读取令牌时可**可选**地携带正整数 `max_reads`（不传或为 `null` 表示**不限次**，既有及新令牌默认如此）：
+
+- **确定/冻结时点**：直接发布在发布请求中确定；受控发布在 `POST .../publish-requests` 提交申请时**冻结**（申请详情以 `token_max_reads` 返回），复核耗时与后续修订不改变它，**批准签发后**才落到新令牌上；申请被驳回不生成令牌或计数。
+- **计数口径**：每次凭**有效**令牌成功读取脱敏正文消耗一次；`reads_used` 只增不减。同一快照的**不同令牌各自独立计数**（同一版本重复发布会复用快照、签出新令牌）。
+- **达上限后**：读取沿用既有模糊拒绝 `403 snapshot unavailable`，公开响应结构不变，不额外暴露“已用尽”这一原因。
+- **不消耗次数的请求**：令牌无效、已撤销、已到期，或令牌与快照不匹配（含快照不存在）。
+- **撤销/到期优先**：即使尚有剩余次数，撤销或到期后读取一律 `403`，不能因尚有次数而放行。
+- **并发安全**：次数判定与递增由公开读取接口内的**同一条条件 `UPDATE`** 原子完成（`reads_used < max_reads` 命中行锁串行化），并发读取的成功次数绝不超过上限；撤销是独立的原子 `UPDATE`，提交后优先生效。
+- **维护侧查询**：`GET /tokens/{token}`（服务密钥）返回 `max_reads` / `reads_used` / `remaining_reads`（不限次时后两者中的上限与剩余为 `null`）及 `active` 等元数据；该接口**不返回快照原文或脱敏正文**，未知令牌 `404`，缺密钥 `401`。
 
 ### 调用示例
 
@@ -95,23 +110,28 @@ curl -sS -X PUT http://localhost:8000/records/<RID> \
 # => {"record_id":"<RID>","version":2}
 # 过期时 => 409 {"detail":{"message":"base_version is stale","current_version":2}}
 
-# 3. 发布版本 2（可另加 "expires_in_seconds": 3600 或 "expires_at": "2026-10-01T00:00:00Z"）
+# 3. 发布版本 2（可另加 "expires_in_seconds": 3600、"expires_at": "2026-10-01T00:00:00Z"、"max_reads": 5）
 curl -sS -X POST http://localhost:8000/records/<RID>/publish \
   -H "X-Service-Key: dev-service-key-change-me" \
   -H "Content-Type: application/json" \
-  -d '{"version": 2}'
-# => {"snapshot_id":"<SID>","version":2,"status":"published","token":"<TOKEN>","expires_at":null}
+  -d '{"version": 2, "max_reads": 5}'
+# => {"snapshot_id":"<SID>","version":2,"status":"published","token":"<TOKEN>","expires_at":null,"max_reads":5}
 
-# 4. 公开读取（无需密钥，只返回脱敏正文）
+# 3b. 维护侧查询已用/剩余次数（不限次令牌 max_reads 与 remaining_reads 为 null）
+curl -sS http://localhost:8000/tokens/<TOKEN> -H "X-Service-Key: dev-service-key-change-me"
+# => {"token":"<TOKEN>","snapshot_id":"<SID>","record_id":"<RID>","version":2,
+#     "max_reads":5,"reads_used":0,"remaining_reads":5,"active":true, ...}
+
+# 4. 公开读取（无需密钥，只返回脱敏正文）；前 5 次 200，第 6 次起 403 snapshot unavailable
 curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
 # => {"record_id":"<RID>","version":2,"status":"published","redacted_text":"患者[已遮蔽]，……"}
 
-# 5. 撤销令牌（撤销完成后，新开始的读取一律 403）
+# 5. 撤销令牌（撤销完成后，即使尚有剩余次数，新开始的读取一律 403）
 curl -sS -X POST http://localhost:8000/tokens/<TOKEN>/revoke \
   -H "X-Service-Key: dev-service-key-change-me"
 ```
 
-完整端到端演示（含 401/409/422、快照不可变、撤销与到期）：
+完整端到端演示（含 401/409/422、快照不可变、`max_reads` 次数上限与独立计数、维护侧计数查询、撤销与到期）：
 
 ```bash
 ./examples/demo.sh        # 依赖 curl 与 jq；可用 BASE_URL / SERVICE_KEY 覆盖默认配置
@@ -124,15 +144,15 @@ curl -sS -X POST http://localhost:8000/tokens/<TOKEN>/revoke \
 ### 语义与规则
 
 1. **标记受控**：机构凭服务密钥 `PUT /records/{id}/controlled`（幂等）。受控记录的直接发布请求返回 `409`；非受控记录的受控申请同样返回 `409`（引导使用正确入口）。
-2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间**，后续修订只产生新版本，不改变待审内容。
+2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at` 与可选正整数 `max_reads`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间，以及读取次数上限**，后续修订只产生新版本，不改变待审内容与上限。
 3. **复核**：具备 `reviewer` 角色的**另一人**批准或驳回：
    - **申请人不得复核**自己的申请（即使其同时拥有 reviewer 角色）→ `403`；
    - 批准与驳回互斥：驳回后不能批准、批准后不能再驳回；对已终结申请再次操作 → `409`；
    - 并发复核由数据库行锁串行化，**同一申请只会产生一个终态**，落选方收到 `409`。
-4. **批准事务**：沿用既有脱敏（合并相交/相邻区间→`[已遮蔽]`）与令牌（`secrets.token_urlsafe(32)`、可选到期）规则，在**同一事务**内生成不可变快照、写入新读取令牌并终结申请；任何一步失败整体回滚，**不会留下可读令牌**。
-5. **驳回**：只终结申请（可记录 `reason`），不生成快照或令牌。
-6. **拒绝不泄露原文**：无凭据/凭据错误 → `401`，无角色 → `403`，未知记录/版本/申请 → `404`，已终结/入口错误 → `409`；申请查询只返回元数据，冻结原文绝不离开服务端。
-7. 批准签发的令牌与直接发布令牌完全一致，可用 `POST /tokens/{token}/revoke` 撤销，并遵守到期规则。
+4. **批准事务**：沿用既有脱敏（合并相交/相邻区间→`[已遮蔽]`）与令牌（`secrets.token_urlsafe(32)`、可选到期）规则，在**同一事务**内生成不可变快照、写入新读取令牌（携带申请时冻结的 `max_reads`）并终结申请；任何一步失败整体回滚，**不会留下可读令牌或计数**。
+5. **驳回**：只终结申请（可记录 `reason`），不生成快照、令牌或读取计数。
+6. **拒绝不泄露原文**：无凭据/凭据错误 → `401`，无角色 → `403`，未知记录/版本/申请 → `404`，已终结/入口错误 → `409`；申请查询只返回元数据（含 `token_max_reads`），冻结原文绝不离开服务端。
+7. 批准签发的令牌与直接发布令牌完全一致：遵守 `max_reads` 次数上限与到期规则，可用 `POST /tokens/{token}/revoke` 撤销，可用 `GET /tokens/{token}` 查询已用/剩余次数。
 
 ### 调用示例
 
@@ -149,11 +169,16 @@ curl -sS -X POST http://localhost:8000/records/<RID>/publish \
 # => 409 {"detail":"record is controlled; submit a publish request for review instead"}
 
 # 1. 申请人 alice（operator）用本人凭据提交历史版本 1 的发布申请
+#    max_reads 在申请时冻结，批准签发后生效（驳回则不生成令牌/计数）
 curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
   -u alice:alice-pw -H "Content-Type: application/json" \
-  -d '{"version": 1}'
+  -d '{"version": 1, "max_reads": 3}'
 # => {"request_id":"<PRID>","record_id":"<RID>","version":1,"status":"pending",
 #     "requested_by":"alice","created_at":"..."}
+
+# 1b. 申请详情可见冻结的上限（只含元数据，不含原文）
+curl -sS http://localhost:8000/publish-requests/<PRID> -u alice:alice-pw
+# => {...,"token_expires_in_seconds":null,"token_expires_at":null,"token_max_reads":3,...}
 
 # 2. 申请人不能复核自己的申请
 curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/approve -u alice:alice-pw
@@ -162,11 +187,13 @@ curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/approve -u alice:
 # 3. 另一人 bob（reviewer）批准：同事务生成不可变快照 + 新读取令牌
 curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/approve -u bob:bob-pw
 # => {"request_id":"<PRID>","record_id":"<RID>","version":1,"status":"approved",
-#     "reviewed_by":"bob","snapshot_id":"<SID>","token":"<TOKEN>","expires_at":null}
+#     "reviewed_by":"bob","snapshot_id":"<SID>","token":"<TOKEN>","expires_at":null,"max_reads":3}
 
-# 4. 公众凭令牌读取冻结版本的脱敏正文（与后续修订无关）
+# 4. 公众凭令牌读取冻结版本的脱敏正文：恰好 3 次 200，第 4 次起 403 snapshot unavailable
 curl -sS "http://localhost:8000/public/snapshots/<SID>?token=<TOKEN>"
 # => {"record_id":"<RID>","version":1,"status":"published","redacted_text":"患者[已遮蔽]，……"}
+curl -sS http://localhost:8000/tokens/<TOKEN> -H "X-Service-Key: dev-service-key-change-me"
+# => {"max_reads":3,"reads_used":1,"remaining_reads":2,"active":true,...}（不含原文）
 
 # —— 驳回路径 ——
 curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
@@ -183,7 +210,7 @@ curl -sS http://localhost:8000/publish-requests/<PRID> -u alice:alice-pw
 curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 ```
 
-完整受控流程演示（含 401/403/404/409、冻结内容、申请人回避、并发复核终态唯一、撤销）：
+完整受控流程演示（含 401/403/404/409、冻结内容与 `max_reads`、申请人回避、并发复核终态唯一、次数用尽与撤销）：
 
 ```bash
 ./examples/demo_controlled.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW / CAROL_PW 覆盖
@@ -206,15 +233,16 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
   - 修订用条件更新 `UPDATE ... WHERE current_version = :base_version`，原子比较并递增，并发修订只有一个成功，其余收到 `409` 与当前版本；
   - 发布用 `INSERT ... ON CONFLICT DO NOTHING` 保证同一版本只有一份快照，快照与令牌同事务提交，不存在部分发布；
   - 受控复核用 `SELECT ... FOR UPDATE` 锁定申请行串行化并发批准/驳回，配合终态检查保证同一申请只有一个终态；
+  - 公开读取的**有效性判定与次数消耗合并为同一条条件 `UPDATE ... WHERE 未撤销 AND 未到期 AND (不限次 OR reads_used < max_reads)`**，命中行即 `reads_used = reads_used + 1`：行锁串行化并发读取，成功次数绝不超过上限；撤销/到期不命中因而不消耗次数，且优先于“尚有剩余次数”；
   - 撤销是单条原子 `UPDATE`，提交后新开始的读取即被拒绝。
-- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期统一返回模糊的 `403 snapshot unavailable`；受控申请的查询接口只返回元数据；错误信息不含原文内容。
-- **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，到期或撤销后读取一律拒绝。直接发布与受控批准共用同一套令牌规则与撤销接口。
+- **不泄露原文**：公开接口只返回快照中的脱敏正文；令牌无效/撤销/到期/次数用尽/与快照不匹配统一返回模糊的 `403 snapshot unavailable`；维护侧令牌查询与受控申请查询只返回元数据与计数，错误信息不含原文内容。
+- **令牌**：`secrets.token_urlsafe(32)` 随机生成；支持 `expires_in_seconds` 或 `expires_at`（二选一）设置到期时间，并支持可选正整数 `max_reads` 读取次数上限；到期、撤销或次数用尽后读取一律拒绝。直接发布与受控批准共用同一套令牌规则、计数、查询与撤销接口。
 - **受控发布**：
   - 申请行保存**冻结副本** `frozen_text`/`frozen_intervals`，复核批准基于副本做脱敏，历史版本行即使变化也不影响待审内容；
   - 批准/驳回先 `SELECT ... FOR UPDATE` 锁定申请行，把并发复核串行化：先提交者写入终态，后提交者看到非 `pending` 收到 `409`，配合 `status` 检查约束，保证同一申请只有一个终态；
   - 批准时**快照、新令牌、申请终态在同一事务提交**，任一异常整体回滚，不会留下无主或可读令牌；驳回不产生快照/令牌；
   - 个人凭据（HTTP Basic）与机构服务密钥（`X-Service-Key`）分离，角色为 `operator`/`reviewer`，申请人与复核人身份按用户名强制不同；
-  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控），新表随 `create_all` 幂等创建。
+  - 既有数据库升级时启动会幂等补列 `records.controlled`（旧记录默认非受控）、`read_tokens.max_reads`/`reads_used`（既有令牌 `max_reads` 为空即继续不限次、已用为 0）与 `publish_requests.token_max_reads`，新表随 `create_all` 幂等创建。
 
 ## 本地开发
 
@@ -239,10 +267,10 @@ python3 -m unittest tests.test_integration_api -v
 
 ```
 app/
-  main.py       # 路由与事务逻辑（含受控发布申请-复核）
-  models.py     # records / record_versions / snapshots / read_tokens / publish_requests
+  main.py       # 路由与事务逻辑（受控发布申请-复核、令牌读取次数计数与查询）
+  models.py     # records / record_versions / snapshots / read_tokens(含 max_reads/reads_used) / publish_requests
   redaction.py  # 区间校验、合并、替换（纯函数）
-  schemas.py    # 请求/响应模型
+  schemas.py    # 请求/响应模型（含 max_reads 与令牌状态响应）
   security.py   # 服务密钥与操作者个人凭据（Basic）鉴权、角色依赖
   config.py     # 环境变量配置（含 REVIEW_CREDENTIALS 校验）
   db.py         # 引擎与会话

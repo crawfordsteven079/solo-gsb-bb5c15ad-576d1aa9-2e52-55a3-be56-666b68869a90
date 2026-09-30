@@ -502,6 +502,277 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
         self.assertEqual(r.status_code, 403)
         self.assertEqual(r.json()["detail"], "snapshot unavailable")
 
+    # ---- 读取次数上限（直接发布） ----
+
+    def _direct_publish(self, version=1, body_extra=None):
+        body = {"version": version}
+        if body_extra:
+            body.update(body_extra)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json=body,
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()
+
+    def test_direct_publish_response_reports_max_reads(self):
+        pub = self._direct_publish(body_extra={"max_reads": 2})
+        self.assertEqual(pub["max_reads"], 2)
+        # 不设上限时该字段为 None（再次发布复用同一快照，签出新令牌）
+        pub_unlimited = self._direct_publish()
+        self.assertIsNone(pub_unlimited["max_reads"])
+        self.assertEqual(pub_unlimited["snapshot_id"], pub["snapshot_id"])
+
+    def test_max_reads_must_be_positive_integer(self):
+        for bad in (0, -1):
+            r = self.client.post(
+                f"/records/{self.record_id}/publish",
+                headers=SERVICE_HEADERS,
+                json={"version": 1, "max_reads": bad},
+            )
+            self.assertEqual(r.status_code, 422, r.text)
+        # 非整数同样 422
+        r = self.client.post(
+            f"/records/{self.record_id}/publish",
+            headers=SERVICE_HEADERS,
+            json={"version": 1, "max_reads": 1.5},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_unlimited_token_can_be_read_repeatedly(self):
+        pub = self._direct_publish()
+        self.assertIsNone(pub["max_reads"])
+        sid, tok = pub["snapshot_id"], pub["token"]
+        for _ in range(7):
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        status_body = r.json()
+        self.assertIsNone(status_body["max_reads"])
+        self.assertIsNone(status_body["remaining_reads"])
+        self.assertEqual(status_body["reads_used"], 7)
+        self.assertTrue(status_body["active"])
+
+    def test_capped_token_allows_exactly_max_reads_then_403(self):
+        pub = self._direct_publish(body_extra={"max_reads": 2})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 前两次成功
+        for expected_used in (1, 2):
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertIn("redacted_text", r.json())
+            q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+            self.assertEqual(q["reads_used"], expected_used)
+            self.assertEqual(q["remaining_reads"], 2 - expected_used)
+        # 第三次起沿用既有模糊拒绝
+        for _ in range(3):
+            r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+            self.assertEqual(r.status_code, 403)
+            self.assertEqual(r.json()["detail"], "snapshot unavailable")
+        # 用尽后计数不再增长，维护侧显示已耗尽
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 2)
+        self.assertEqual(q["remaining_reads"], 0)
+        self.assertFalse(q["active"])
+        # 维护侧响应不含原文
+        r = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS)
+        self.assertNotIn(TEXT_V1, r.text)
+
+    def test_invalid_revoked_and_mismatched_requests_do_not_consume(self):
+        pub = self._direct_publish(body_extra={"max_reads": 2})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        # 第一次成功
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        # 无效令牌不消耗
+        r = self.client.get(f"/public/snapshots/{sid}?token=wrong-token")
+        self.assertEqual(r.status_code, 403)
+        # 令牌与快照不匹配：给同一快照再签发一个令牌，交叉使用
+        other = self._read_token_for_same_snapshot_via_republish(
+            sid, body_extra={"max_reads": 2}
+        )
+        self.assertNotEqual(other, tok)
+        r = self.client.get(f"/public/snapshots/{sid}?token={other}")
+        self.assertEqual(r.status_code, 200, r.text)
+        # 用 other 访问一个不存在的快照：403，不消耗 other
+        import uuid
+
+        r = self.client.get(
+            f"/public/snapshots/{uuid.uuid4()}?token={other}"
+        )
+        self.assertEqual(r.status_code, 403)
+        q = self.client.get(f"/tokens/{other}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        # 撤销后读取 403，不消耗剩余次数
+        self.assertEqual(
+            self.client.post(f"/tokens/{tok}/revoke", headers=SERVICE_HEADERS).status_code,
+            200,
+        )
+        r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+        self.assertEqual(r.status_code, 403)
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertFalse(q["active"])
+        self.assertIsNotNone(q["revoked_at"])
+
+    def _read_token_for_same_snapshot_via_republish(self, existing_snapshot_id, body_extra=None):
+        """同一快照可由再次直接发布签发出另一支令牌（ON CONFLICT 复用快照）。"""
+        pub = self._direct_publish(body_extra=body_extra)
+        self.assertEqual(pub["snapshot_id"], existing_snapshot_id)
+        return pub["token"]
+
+    def test_distinct_tokens_on_same_snapshot_count_independently(self):
+        pub1 = self._direct_publish(body_extra={"max_reads": 1})
+        sid = pub1["snapshot_id"]
+        tok1 = pub1["token"]
+        tok2 = self._read_token_for_same_snapshot_via_republish(sid)
+        # 第二次直接发布未携带 max_reads -> 新令牌不限次
+        q2 = self.client.get(f"/tokens/{tok2}", headers=SERVICE_HEADERS).json()
+        self.assertIsNone(q2["max_reads"])
+        # tok1 用尽
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok1}").status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok1}").status_code, 403
+        )
+        # tok2 不受影响，继续可读
+        for _ in range(4):
+            self.assertEqual(
+                self.client.get(f"/public/snapshots/{sid}?token={tok2}").status_code, 200
+            )
+        q1 = self.client.get(f"/tokens/{tok1}", headers=SERVICE_HEADERS).json()
+        q2 = self.client.get(f"/tokens/{tok2}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q1["reads_used"], 1)
+        self.assertEqual(q2["reads_used"], 4)
+
+    def test_expiry_or_revocation_takes_precedence_over_remaining_reads(self):
+        pub = self._direct_publish(body_extra={"max_reads": 5, "expires_in_seconds": 1})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        import time as _time
+
+        _time.sleep(1.2)
+        # 仍有剩余次数，但已到期 -> 403，不消耗
+        r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+        self.assertEqual(r.status_code, 403)
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 1)
+        self.assertFalse(q["active"])
+        self.assertEqual(q["remaining_reads"], 4)
+
+    def test_concurrent_reads_never_exceed_max_reads(self):
+        pub = self._direct_publish(body_extra={"max_reads": 10})
+        sid, tok = pub["snapshot_id"], pub["token"]
+        successes: list[int] = []
+        failures: list[int] = []
+        barrier = threading.Barrier(20)
+
+        def read_once():
+            barrier.wait()
+            client = TestClient(app_main.app)
+            code = client.get(f"/public/snapshots/{sid}?token={tok}").status_code
+            (successes if code == 200 else failures).append(code)
+
+        threads = [threading.Thread(target=read_once) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(successes), 10, successes + failures)
+        self.assertEqual(len(failures), 10)
+        self.assertTrue(all(code == 403 for code in failures))
+        q = self.client.get(f"/tokens/{tok}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 10)
+        self.assertEqual(q["remaining_reads"], 0)
+
+    def test_token_status_unknown_token_404_and_requires_service_key(self):
+        r = self.client.get("/tokens/not-a-real-token", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 404)
+        r = self.client.get("/tokens/not-a-real-token")
+        self.assertEqual(r.status_code, 401)
+
+    # ---- 读取次数上限（受控发布：申请冻结、批准生效） ----
+
+    def test_controlled_max_reads_frozen_at_submission_and_effective_after_approval(self):
+        self._mark_controlled()
+        self._submit(version=1, expires={"max_reads": 2})
+        request_id = self._latest_request_id()
+        # 申请详情可见冻结的上限（不泄露原文）
+        r = self.client.get(f"/publish-requests/{request_id}", auth=BASIC_ALICE)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["token_max_reads"], 2)
+        self.assertNotIn(TEXT_V1, r.text)
+        # 批准签发结果携带上限
+        r = self.client.post(f"/publish-requests/{request_id}/approve", auth=BASIC_BOB)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["max_reads"], 2)
+        sid, tok = r.json()["snapshot_id"], r.json()["token"]
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        self.assertEqual(
+            self.client.get(f"/public/snapshots/{sid}?token={tok}").status_code, 200
+        )
+        r = self.client.get(f"/public/snapshots/{sid}?token={tok}")
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["detail"], "snapshot unavailable")
+
+    def test_controlled_reject_creates_no_token_or_counters(self):
+        from sqlalchemy import select
+
+        from app.db import SessionLocal
+        from app.models import ReadToken as ReadTokenModel
+        from app.models import Snapshot as SnapshotModel
+
+        self._mark_controlled()
+        self._submit(version=1, expires={"max_reads": 3})
+        request_id = self._latest_request_id()
+        r = self.client.post(
+            f"/publish-requests/{request_id}/reject",
+            auth=BASIC_BOB,
+            json={"reason": "不予发布"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["token_max_reads"], 3)
+        with SessionLocal() as session:
+            # 驳回不产生快照/令牌（限定本记录，不受其他用例数据影响）
+            token_count = (
+                session.query(ReadTokenModel)
+                .filter(
+                    ReadTokenModel.snapshot_id.in_(
+                        select(SnapshotModel.id).where(
+                            SnapshotModel.record_id == self.record_id
+                        )
+                    )
+                )
+                .count()
+            )
+            self.assertEqual(token_count, 0)
+            snapshot_count = (
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .count()
+            )
+            self.assertEqual(snapshot_count, 0)
+        # 驳回后不能批准
+        self.assertEqual(
+            self.client.post(
+                f"/publish-requests/{request_id}/approve", auth=BASIC_BOB
+            ).status_code,
+            409,
+        )
+
+    def test_controlled_max_reads_must_be_positive(self):
+        self._mark_controlled()
+        r = self._submit(version=1, expires={"max_reads": 0}, expected=422)
+        self.assertNotIn(TEXT_V1, r.text)
+
     # ---- 数据库升级路径 ----
 
     def test_existing_db_gets_controlled_column(self):
@@ -519,6 +790,55 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
         r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["controlled"])
+
+    def test_existing_db_gets_read_limit_columns(self):
+        from sqlalchemy import inspect, text
+
+        from app.db import engine
+
+        # 先发布一支令牌，模拟既有部署的 read_tokens / publish_requests 数据
+        pub = self._direct_publish()
+        token = pub["token"]
+        self._mark_controlled()
+        self._submit(version=1)
+        request_id = self._latest_request_id()
+
+        with engine.begin() as conn:
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN max_reads"))
+            conn.execute(text("ALTER TABLE read_tokens DROP COLUMN reads_used"))
+            conn.execute(text("ALTER TABLE publish_requests DROP COLUMN token_max_reads"))
+        app_main._init_db_with_retry()
+        inspector = inspect(engine)
+        token_columns = {c["name"] for c in inspector.get_columns("read_tokens")}
+        request_columns = {c["name"] for c in inspector.get_columns("publish_requests")}
+        self.assertIn("max_reads", token_columns)
+        self.assertIn("reads_used", token_columns)
+        self.assertIn("token_max_reads", request_columns)
+
+        from app.db import SessionLocal
+        from app.models import PublishRequest as PRModel
+        from app.models import ReadToken as RTModel
+
+        with SessionLocal() as session:
+            # 既有令牌迁移后继续不限次，已用次数为 0
+            existing = session.get(RTModel, token)
+            self.assertIsNone(existing.max_reads)
+            self.assertEqual(existing.reads_used, 0)
+            pr = session.get(PRModel, request_id)
+            self.assertIsNone(pr.token_max_reads)
+
+        # 服务升级后既有令牌仍可继续不限次读取
+        r = self.client.get(
+            f"/public/snapshots/{pub['snapshot_id']}?token={token}"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get(
+            f"/public/snapshots/{pub['snapshot_id']}?token={token}"
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        q = self.client.get(f"/tokens/{token}", headers=SERVICE_HEADERS).json()
+        self.assertEqual(q["reads_used"], 2)
+        self.assertIsNone(q["remaining_reads"])
 
 
 if __name__ == "__main__":
